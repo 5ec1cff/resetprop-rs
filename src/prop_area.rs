@@ -36,6 +36,11 @@ pub enum PropAreaError {
     InvalidBytesUsed(u32),
     InvalidOffset(u32),
     InvalidKey(String),
+    InPlaceUpdateTooLong {
+        name: String,
+        new_len: usize,
+        max_len: usize,
+    },
     Corrupted(&'static str),
     AreaFull { requested: u32, available: u32 },
 }
@@ -56,6 +61,14 @@ impl fmt::Display for PropAreaError {
             }
             Self::InvalidOffset(offset) => write!(f, "invalid data offset: {offset}"),
             Self::InvalidKey(key) => write!(f, "invalid property key: {key}"),
+            Self::InPlaceUpdateTooLong {
+                name,
+                new_len,
+                max_len,
+            } => write!(
+                f,
+                "cannot update property '{name}' in place: new value length {new_len} exceeds max {max_len}"
+            ),
             Self::Corrupted(message) => write!(f, "corrupted prop area: {message}"),
             Self::AreaFull {
                 requested,
@@ -472,10 +485,8 @@ impl<M: Read + Write + Seek> PropArea<M> {
         let record = self.read_prop_record(prop_offset)?;
         if record.is_long {
             self.update_long_property(prop_offset, &record.name, value)?;
-        } else if value.len() < PROP_VALUE_MAX {
-            self.update_inline_property(prop_offset, value)?;
         } else {
-            self.convert_inline_property_to_long(prop_offset, &record.name, value)?;
+            self.update_inline_property_in_place(prop_offset, &record.name, value)?;
         }
 
         Ok(())
@@ -573,7 +584,7 @@ impl<M: Read + Write + Seek> PropArea<M> {
         if value.len() >= PROP_VALUE_MAX {
             self.write_long_layout(prop_offset, name_len, value)?;
         } else {
-            self.update_inline_property(prop_offset, value)?;
+            self.initialize_inline_property(prop_offset, value)?;
         }
 
         self.write_bytes_data(prop_offset + PROP_INFO_SIZE, name.as_bytes())?;
@@ -581,7 +592,7 @@ impl<M: Read + Write + Seek> PropArea<M> {
         Ok(prop_offset)
     }
 
-    fn update_inline_property(&mut self, prop_offset: u32, value: &str) -> Result<()> {
+    fn write_inline_value_bytes(&mut self, prop_offset: u32, value: &str) -> Result<()> {
         if value.len() >= PROP_VALUE_MAX {
             return Err(PropAreaError::Corrupted("inline property value too large"));
         }
@@ -589,14 +600,30 @@ impl<M: Read + Write + Seek> PropArea<M> {
         self.zero_data(prop_offset + 4, PROP_VALUE_MAX as u32)?;
         self.write_bytes_data(prop_offset + 4, value.as_bytes())?;
         self.write_bytes_data(prop_offset + 4 + value.len() as u32, &[0])?;
+        Ok(())
+    }
+
+    fn initialize_inline_property(&mut self, prop_offset: u32, value: &str) -> Result<()> {
+        if value.len() >= PROP_VALUE_MAX {
+            return Err(PropAreaError::Corrupted("inline property value too large"));
+        }
+
+        self.write_inline_value_bytes(prop_offset, value)?;
         let serial = (value.len() as u32) << 24;
         self.write_u32_data(prop_offset + PROP_SERIAL_OFFSET, serial)?;
         Ok(())
     }
 
-    fn convert_inline_property_to_long(&mut self, prop_offset: u32, name: &str, value: &str) -> Result<()> {
-        let name_len = u32::try_from(name.len()).map_err(|_| PropAreaError::Corrupted("name too long"))?;
-        self.write_long_layout(prop_offset, name_len, value)
+    fn update_inline_property_in_place(&mut self, prop_offset: u32, name: &str, value: &str) -> Result<()> {
+        if value.len() >= PROP_VALUE_MAX {
+            return Err(PropAreaError::InPlaceUpdateTooLong {
+                name: name.to_owned(),
+                new_len: value.len(),
+                max_len: PROP_VALUE_MAX - 1,
+            });
+        }
+
+        self.write_inline_value_bytes(prop_offset, value)
     }
 
     fn update_long_property(&mut self, prop_offset: u32, name: &str, value: &str) -> Result<()> {
@@ -609,19 +636,19 @@ impl<M: Read + Write + Seek> PropArea<M> {
             .checked_add(current_rel)
             .ok_or(PropAreaError::InvalidOffset(prop_offset))?;
         let current_bytes = self.read_c_string_bytes(current_offset, None)?;
-        let current_capacity = current_bytes.len() as u32 + 1;
+        let current_len = current_bytes.len();
+        if value.len() > current_len {
+            return Err(PropAreaError::InPlaceUpdateTooLong {
+                name: name.to_owned(),
+                new_len: value.len(),
+                max_len: current_len,
+            });
+        }
+        let current_capacity = current_len as u32 + 1;
 
-        let target_offset = if value.len() as u32 + 1 <= current_capacity {
-            current_offset
-        } else {
-            let name_len = u32::try_from(name.len()).map_err(|_| PropAreaError::Corrupted("name too long"))?;
-            self.write_long_layout(prop_offset, name_len, value)?;
-            return Ok(());
-        };
-
-        self.zero_data(target_offset, current_capacity)?;
-        self.write_bytes_data(target_offset, value.as_bytes())?;
-        self.write_bytes_data(target_offset + value.len() as u32, &[0])?;
+        self.zero_data(current_offset, current_capacity)?;
+        self.write_bytes_data(current_offset, value.as_bytes())?;
+        self.write_bytes_data(current_offset + value.len() as u32, &[0])?;
         Ok(())
     }
 
