@@ -10,6 +10,8 @@
 //! sysprop set <KEY> <VALUE>
 //! sysprop del <KEY>
 //! sysprop list [--context <CTX>] [--show-context] [--error-output <auto|on|off>]
+//! sysprop scan [--context <CTX>] [--objects] [--error-output <auto|on|off>]
+//! sysprop compact [--context <CTX>] [--error-output <auto|on|off>]
 //! sysprop getcontext <KEY>
 //! sysprop dump-context <CONTEXT>
 //! sysprop list-contexts [--existing-only]
@@ -108,6 +110,34 @@ enum Commands {
         /// Print the SELinux context label next to each property.
         #[arg(long)]
         show_context: bool,
+
+        /// Controls aggregated error output while reading multiple prop areas.
+        /// `auto` = disabled on Android targets, enabled elsewhere.
+        #[arg(long, value_enum, default_value_t = ErrorOutputMode::Auto)]
+        error_output: ErrorOutputMode,
+    },
+
+    /// Scan allocation objects/holes across every context.
+    Scan {
+        /// Only scan this SELinux context.
+        #[arg(long)]
+        context: Option<String>,
+
+        /// Print detailed object list in addition to holes.
+        #[arg(long)]
+        objects: bool,
+
+        /// Controls aggregated error output while compacting multiple prop areas.
+        /// `auto` = disabled on Android targets, enabled elsewhere.
+        #[arg(long, value_enum, default_value_t = ErrorOutputMode::Auto)]
+        error_output: ErrorOutputMode,
+    },
+
+    /// Compact prop areas across every context.
+    Compact {
+        /// Only compact this SELinux context.
+        #[arg(long)]
+        context: Option<String>,
 
         /// Controls aggregated error output while scanning multiple prop areas.
         /// `auto` = disabled on Android targets, enabled elsewhere.
@@ -245,7 +275,7 @@ fn path_io_err(path: &Path, err: io::Error) -> AppError {
 }
 
 #[derive(Debug)]
-enum OpenAreaRoDetailedError {
+enum OpenAreaDetailedError {
     Io(io::Error),
     Parse(PropAreaError),
 }
@@ -352,10 +382,10 @@ fn open_area_ro(path: &Path) -> AppResult<MmapRoArea> {
 
 /// Open a prop area file read-only while preserving whether the failure came
 /// from the file open itself or from parsing the prop area contents.
-fn open_area_ro_detailed(path: &Path) -> Result<MmapRoArea, OpenAreaRoDetailedError> {
-    let f = File::open(path).map_err(OpenAreaRoDetailedError::Io)?;
-    let map = unsafe { MmapOptions::new().map(&f) }.map_err(OpenAreaRoDetailedError::Io)?;
-    PropArea::new(MmapCursor::new(map)).map_err(OpenAreaRoDetailedError::Parse)
+fn open_area_ro_detailed(path: &Path) -> Result<MmapRoArea, OpenAreaDetailedError> {
+    let f = File::open(path).map_err(OpenAreaDetailedError::Io)?;
+    let map = unsafe { MmapOptions::new().map(&f) }.map_err(OpenAreaDetailedError::Io)?;
+    PropArea::new(MmapCursor::new(map)).map_err(OpenAreaDetailedError::Parse)
 }
 
 /// Open a prop area file read-write using a shared read-write memory map.
@@ -368,6 +398,18 @@ fn open_area_rw(path: &Path) -> AppResult<MmapRwArea> {
     let map = unsafe { MmapOptions::new().map_mut(&f) }
         .map_err(|e| format!("{}: {e}", path.display()))?;
     PropArea::new(MmapCursor::new(map)).map_err(prop_area_err)
+}
+
+/// Open a prop area file read-write while preserving whether the failure came
+/// from the file open itself or from parsing the prop area contents.
+fn open_area_rw_detailed(path: &Path) -> Result<MmapRwArea, OpenAreaDetailedError> {
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(OpenAreaDetailedError::Io)?;
+    let map = unsafe { MmapOptions::new().map_mut(&f) }.map_err(OpenAreaDetailedError::Io)?;
+    PropArea::new(MmapCursor::new(map)).map_err(OpenAreaDetailedError::Parse)
 }
 
 fn require_props_dir<'a>(props_dir: Option<&'a Path>) -> AppResult<&'a Path> {
@@ -413,6 +455,79 @@ fn resolve_area_path(
         }
         (None, None) => Err("area: exactly one of --context or --path is required".into()),
         (Some(_), Some(_)) => Err("area: --context and --path are mutually exclusive".into()),
+    }
+}
+
+fn resolve_context_targets(
+    pc: &PropertyContext,
+    filter_context: Option<&str>,
+) -> io::Result<Vec<(String, PathBuf)>> {
+    if let Some(ctx) = filter_context {
+        Ok(vec![(ctx.to_string(), pc.context_file_path(ctx))])
+    } else {
+        pc.prop_area_files()
+    }
+}
+
+fn format_open_area_error(path: &Path, error: OpenAreaDetailedError) -> String {
+    match error {
+        OpenAreaDetailedError::Io(err) => format!("{}: {err}", path.display()),
+        OpenAreaDetailedError::Parse(err) => format!("{}: {err}", path.display()),
+    }
+}
+
+fn record_area_open_error(
+    path: &Path,
+    error: OpenAreaDetailedError,
+    specific_context: bool,
+    skipped_permission_denied: &mut usize,
+    skipped_missing: &mut usize,
+    other_errors: &mut Vec<String>,
+) -> AppResult<()> {
+    if specific_context {
+        return Err(format_open_area_error(path, error).into());
+    }
+
+    match error {
+        OpenAreaDetailedError::Io(err) => match err.kind() {
+            io::ErrorKind::PermissionDenied => *skipped_permission_denied += 1,
+            io::ErrorKind::NotFound => *skipped_missing += 1,
+            _ => other_errors.push(format!("{}: {err}", path.display())),
+        },
+        OpenAreaDetailedError::Parse(err) => {
+            other_errors.push(format!("{}: {err}", path.display()));
+        }
+    }
+
+    Ok(())
+}
+
+fn print_multi_area_error_summary(
+    emit_error_output: bool,
+    skipped_permission_denied: usize,
+    skipped_missing: usize,
+    other_errors: &[String],
+) {
+    if !emit_error_output {
+        return;
+    }
+
+    if skipped_permission_denied > 0 {
+        eprintln!(
+            "note: skipped {skipped_permission_denied} prop area(s) due to permission denied"
+        );
+    }
+    if skipped_missing > 0 {
+        eprintln!("note: skipped {skipped_missing} prop area(s) that do not exist");
+    }
+    for message in other_errors.iter().take(3) {
+        eprintln!("warning: {message}");
+    }
+    if other_errors.len() > 3 {
+        eprintln!(
+            "warning: suppressed {} additional prop area error(s)",
+            other_errors.len() - 3
+        );
     }
 }
 
@@ -469,32 +584,166 @@ fn cmd_area_scan(area_path: &Path, show_objects: bool) -> AppResult<()> {
     Ok(())
 }
 
+fn compact_result_summary(result: &CompactResult) -> String {
+    match result {
+        CompactResult::NoHoles => "no holes found, area is already fully packed".to_string(),
+        CompactResult::AdjustedBytesUsed { old, new } => format!(
+            "reclaimed trailing hole — bytes_used {} → {} (freed {})",
+            old,
+            new,
+            old - new,
+        ),
+        CompactResult::MovedObjects {
+            old,
+            new,
+            objects_moved,
+        } => format!(
+            "moved {} object(s) — bytes_used {} → {} (freed {})",
+            objects_moved,
+            old,
+            new,
+            old - new,
+        ),
+    }
+}
+
 fn cmd_area_compact(area_path: &Path) -> AppResult<()> {
     let mut area = open_area_rw(area_path)?;
     let result = area.compact_allocations().map_err(prop_area_err)?;
     area.into_inner().flush().map_err(|e| path_io_err(area_path, e))?;
-    match result {
-        CompactResult::NoHoles => {
-            eprintln!("compact: no holes found, area is already fully packed");
+    eprintln!("compact: {}", compact_result_summary(&result));
+    Ok(())
+}
+
+fn cmd_scan(
+    props_dir: Option<&Path>,
+    system_root: Option<&Path>,
+    filter_context: Option<&str>,
+    show_objects: bool,
+    error_output: ErrorOutputMode,
+) -> AppResult<()> {
+    let pc = load_context(props_dir, system_root)?;
+    let specific_context = filter_context.is_some();
+    let emit_error_output = error_output.enabled();
+    let targets = resolve_context_targets(&pc, filter_context)?;
+
+    let mut skipped_permission_denied = 0usize;
+    let mut skipped_missing = 0usize;
+    let mut other_errors = Vec::new();
+    let mut printed_any = false;
+
+    for (ctx_label, path) in &targets {
+        let mut area = match open_area_ro_detailed(path) {
+            Ok(area) => area,
+            Err(error) => {
+                record_area_open_error(
+                    path,
+                    error,
+                    specific_context,
+                    &mut skipped_permission_denied,
+                    &mut skipped_missing,
+                    &mut other_errors,
+                )?;
+                continue;
+            }
+        };
+
+        let report = match area.scan_allocations() {
+            Ok(report) => report,
+            Err(err) => {
+                let message = format!("{}: {err}", path.display());
+                if specific_context {
+                    return Err(message.into());
+                }
+                other_errors.push(message);
+                continue;
+            }
+        };
+
+        if printed_any {
+            println!();
         }
-        CompactResult::AdjustedBytesUsed { old, new } => {
-            eprintln!(
-                "compact: reclaimed trailing hole — bytes_used {} → {} (freed {})",
-                old,
-                new,
-                old - new,
-            );
-        }
-        CompactResult::MovedObjects { old, new, objects_moved } => {
-            eprintln!(
-                "compact: moved {} object(s) — bytes_used {} → {} (freed {})",
-                objects_moved,
-                old,
-                new,
-                old - new,
-            );
-        }
+        printed_any = true;
+
+        println!("# context: {ctx_label}  |  file: {}", path.display());
+        print_allocation_scan(&report, show_objects);
     }
+
+    if !specific_context {
+        print_multi_area_error_summary(
+            emit_error_output,
+            skipped_permission_denied,
+            skipped_missing,
+            &other_errors,
+        );
+    }
+
+    Ok(())
+}
+
+fn cmd_compact(
+    props_dir: Option<&Path>,
+    system_root: Option<&Path>,
+    filter_context: Option<&str>,
+    error_output: ErrorOutputMode,
+) -> AppResult<()> {
+    let pc = load_context(props_dir, system_root)?;
+    let specific_context = filter_context.is_some();
+    let emit_error_output = error_output.enabled();
+    let targets = resolve_context_targets(&pc, filter_context)?;
+
+    let mut skipped_permission_denied = 0usize;
+    let mut skipped_missing = 0usize;
+    let mut other_errors = Vec::new();
+
+    for (ctx_label, path) in &targets {
+        let mut area = match open_area_rw_detailed(path) {
+            Ok(area) => area,
+            Err(error) => {
+                record_area_open_error(
+                    path,
+                    error,
+                    specific_context,
+                    &mut skipped_permission_denied,
+                    &mut skipped_missing,
+                    &mut other_errors,
+                )?;
+                continue;
+            }
+        };
+
+        let result = match area.compact_allocations() {
+            Ok(result) => result,
+            Err(err) => {
+                let message = format!("{}: {err}", path.display());
+                if specific_context {
+                    return Err(message.into());
+                }
+                other_errors.push(message);
+                continue;
+            }
+        };
+
+        if let Err(err) = area.into_inner().flush() {
+            if specific_context {
+                return Err(path_io_err(path, err));
+            }
+            other_errors.push(format!("{}: {err}", path.display()));
+            continue;
+        }
+
+        eprintln!("[{ctx_label}] {}", compact_result_summary(&result));
+    }
+
+    if !specific_context {
+        print_multi_area_error_summary(
+            emit_error_output,
+            skipped_permission_denied,
+            skipped_missing,
+            &other_errors,
+        );
+    }
+
     Ok(())
 }
 
@@ -562,11 +811,7 @@ fn cmd_list(
     let emit_error_output = error_output.enabled();
 
     // Determine which (context_label, file_path) pairs to iterate.
-    let targets: Vec<(String, PathBuf)> = if let Some(ctx) = filter_context {
-        vec![(ctx.to_string(), pc.context_file_path(ctx))]
-    } else {
-        pc.prop_area_files()?
-    };
+    let targets = resolve_context_targets(&pc, filter_context)?;
 
     let mut skipped_permission_denied = 0usize;
     let mut skipped_missing = 0usize;
@@ -575,29 +820,15 @@ fn cmd_list(
     for (ctx_label, path) in &targets {
         let mut area = match open_area_ro_detailed(path) {
             Ok(a) => a,
-            Err(e) => {
-                if specific_context {
-                    let message = match e {
-                        OpenAreaRoDetailedError::Io(err) => {
-                            format!("{}: {err}", path.display())
-                        }
-                        OpenAreaRoDetailedError::Parse(err) => {
-                            format!("{}: {err}", path.display())
-                        }
-                    };
-                    return Err(message.into());
-                }
-
-                match e {
-                    OpenAreaRoDetailedError::Io(err) => match err.kind() {
-                        io::ErrorKind::PermissionDenied => skipped_permission_denied += 1,
-                        io::ErrorKind::NotFound => skipped_missing += 1,
-                        _ => other_errors.push(format!("{}: {err}", path.display())),
-                    },
-                    OpenAreaRoDetailedError::Parse(err) => {
-                        other_errors.push(format!("{}: {err}", path.display()));
-                    }
-                }
+            Err(error) => {
+                record_area_open_error(
+                    path,
+                    error,
+                    specific_context,
+                    &mut skipped_permission_denied,
+                    &mut skipped_missing,
+                    &mut other_errors,
+                )?;
                 continue;
             }
         };
@@ -611,24 +842,13 @@ fn cmd_list(
         .map_err(prop_area_err)?;
     }
 
-    if !specific_context && emit_error_output {
-        if skipped_permission_denied > 0 {
-            eprintln!(
-                "note: skipped {skipped_permission_denied} prop area(s) due to permission denied"
-            );
-        }
-        if skipped_missing > 0 {
-            eprintln!("note: skipped {skipped_missing} prop area(s) that do not exist");
-        }
-        for message in other_errors.iter().take(3) {
-            eprintln!("warning: {message}");
-        }
-        if other_errors.len() > 3 {
-            eprintln!(
-                "warning: suppressed {} additional prop area error(s)",
-                other_errors.len() - 3
-            );
-        }
+    if !specific_context {
+        print_multi_area_error_summary(
+            emit_error_output,
+            skipped_permission_denied,
+            skipped_missing,
+            &other_errors,
+        );
     }
 
     Ok(())
@@ -816,6 +1036,21 @@ fn run() -> AppResult<()> {
             *show_context,
             *error_output,
         ),
+        Commands::Scan {
+            context,
+            objects,
+            error_output,
+        } => cmd_scan(
+            props_dir,
+            system_root,
+            context.as_deref(),
+            *objects,
+            *error_output,
+        ),
+        Commands::Compact {
+            context,
+            error_output,
+        } => cmd_compact(props_dir, system_root, context.as_deref(), *error_output),
         Commands::Getcontext { key } => cmd_getcontext(props_dir, system_root, key),
         Commands::DumpContext { context } => cmd_dump_context(props_dir, system_root, context),
         Commands::ListContexts { existing_only } => {
