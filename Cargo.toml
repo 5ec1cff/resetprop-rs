@@ -9,3 +9,11 @@ path = "src/lib.rs"
 [[bin]]
 name = "read_props"
 path = "src/bin/read_props.rs"
+
+[[bin]]
+name = "write_props"
+path = "src/bin/write_props.rs"
+
+[[bin]]
+name = "gen_sample_props"
+path = "src/bin/gen_sample_props.rs"
