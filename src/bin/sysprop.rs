@@ -9,7 +9,7 @@
 //! sysprop get <KEY>
 //! sysprop set <KEY> <VALUE>
 //! sysprop del <KEY>
-//! sysprop list [--context <CTX>] [--show-context]
+//! sysprop list [--context <CTX>] [--show-context] [--error-output <auto|on|off>]
 //! sysprop getcontext <KEY>
 //! sysprop dump-context <CONTEXT>
 //! sysprop list-contexts [--existing-only]
@@ -33,10 +33,11 @@
 
 use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use resetprop_rs::{PropArea, PropAreaError, PropertyContext};
 
@@ -101,6 +102,11 @@ enum Commands {
         /// Print the SELinux context label next to each property.
         #[arg(long)]
         show_context: bool,
+
+        /// Controls aggregated error output while scanning multiple prop areas.
+        /// `auto` = disabled on Android targets, enabled elsewhere.
+        #[arg(long, value_enum, default_value_t = ErrorOutputMode::Auto)]
+        error_output: ErrorOutputMode,
     },
 
     /// Print the SELinux context string that owns a property name.
@@ -126,6 +132,33 @@ enum Commands {
 
     /// Operate on a single prop area file.
     Area(AreaArgs),
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ErrorOutputMode {
+    Auto,
+    On,
+    Off,
+}
+
+impl ErrorOutputMode {
+    fn enabled(self) -> bool {
+        match self {
+            Self::Auto => Self::auto_enabled(),
+            Self::On => true,
+            Self::Off => false,
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    const fn auto_enabled() -> bool {
+        false
+    }
+
+    #[cfg(not(target_os = "android"))]
+    const fn auto_enabled() -> bool {
+        true
+    }
 }
 
 /// Arguments for the `area` subcommand.
@@ -185,6 +218,12 @@ fn prop_area_err(e: PropAreaError) -> AppError {
     Box::new(e)
 }
 
+#[derive(Debug)]
+enum OpenAreaRoDetailedError {
+    Io(io::Error),
+    Parse(PropAreaError),
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -194,6 +233,13 @@ fn open_area_ro(path: &Path) -> AppResult<PropArea<File>> {
     let f = File::open(path)
         .map_err(|e| format!("{}: {e}", path.display()))?;
     PropArea::new(f).map_err(prop_area_err)
+}
+
+/// Open a prop area file read-only while preserving whether the failure came
+/// from the file open itself or from parsing the prop area contents.
+fn open_area_ro_detailed(path: &Path) -> Result<PropArea<File>, OpenAreaRoDetailedError> {
+    let f = File::open(path).map_err(OpenAreaRoDetailedError::Io)?;
+    PropArea::new(f).map_err(OpenAreaRoDetailedError::Parse)
 }
 
 /// Open a prop area file read-write.
@@ -307,8 +353,11 @@ fn cmd_list(
     system_root: Option<&Path>,
     filter_context: Option<&str>,
     show_context: bool,
+    error_output: ErrorOutputMode,
 ) -> AppResult<()> {
     let pc = load_context(props_dir, system_root)?;
+    let specific_context = filter_context.is_some();
+    let emit_error_output = error_output.enabled();
 
     // Determine which (context_label, file_path) pairs to iterate.
     let targets: Vec<(String, PathBuf)> = if let Some(ctx) = filter_context {
@@ -317,12 +366,36 @@ fn cmd_list(
         pc.prop_area_files()?
     };
 
+    let mut skipped_permission_denied = 0usize;
+    let mut skipped_missing = 0usize;
+    let mut other_errors = Vec::new();
+
     for (ctx_label, path) in &targets {
-        let mut area = match open_area_ro(path) {
+        let mut area = match open_area_ro_detailed(path) {
             Ok(a) => a,
             Err(e) => {
-                // Non-fatal: a context file might simply not exist yet.
-                eprintln!("warning: skipping {}: {e}", path.display());
+                if specific_context {
+                    let message = match e {
+                        OpenAreaRoDetailedError::Io(err) => {
+                            format!("{}: {err}", path.display())
+                        }
+                        OpenAreaRoDetailedError::Parse(err) => {
+                            format!("{}: {err}", path.display())
+                        }
+                    };
+                    return Err(message.into());
+                }
+
+                match e {
+                    OpenAreaRoDetailedError::Io(err) => match err.kind() {
+                        io::ErrorKind::PermissionDenied => skipped_permission_denied += 1,
+                        io::ErrorKind::NotFound => skipped_missing += 1,
+                        _ => other_errors.push(format!("{}: {err}", path.display())),
+                    },
+                    OpenAreaRoDetailedError::Parse(err) => {
+                        other_errors.push(format!("{}: {err}", path.display()));
+                    }
+                }
                 continue;
             }
         };
@@ -335,6 +408,27 @@ fn cmd_list(
         })
         .map_err(prop_area_err)?;
     }
+
+    if !specific_context && emit_error_output {
+        if skipped_permission_denied > 0 {
+            eprintln!(
+                "note: skipped {skipped_permission_denied} prop area(s) due to permission denied"
+            );
+        }
+        if skipped_missing > 0 {
+            eprintln!("note: skipped {skipped_missing} prop area(s) that do not exist");
+        }
+        for message in other_errors.iter().take(3) {
+            eprintln!("warning: {message}");
+        }
+        if other_errors.len() > 3 {
+            eprintln!(
+                "warning: suppressed {} additional prop area error(s)",
+                other_errors.len() - 3
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -499,11 +593,13 @@ fn run() -> AppResult<()> {
         Commands::List {
             context,
             show_context,
+            error_output,
         } => cmd_list(
             props_dir,
             system_root,
             context.as_deref(),
             *show_context,
+            *error_output,
         ),
         Commands::Getcontext { key } => cmd_getcontext(props_dir, system_root, key),
         Commands::DumpContext { context } => cmd_dump_context(props_dir, system_root, context),
