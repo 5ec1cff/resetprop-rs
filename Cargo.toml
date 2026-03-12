@@ -5,3 +5,7 @@ edition = "2021"
 
 [lib]
 path = "src/lib.rs"
+
+[[bin]]
+name = "read_props"
+path = "src/bin/read_props.rs"
