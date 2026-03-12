@@ -639,8 +639,9 @@ impl PropertyContext {
     /// Enumerate prop-area files under `props_dir` as `(context_name, path)`.
     ///
     /// - **PreSplit**: single entry `(PRE_SPLIT_CONTEXT, props_dir)`.
-    /// - **Serialized / Split**: every regular file in `props_dir` except
-    ///   `property_info` and `properties_serial`, sorted by name.
+    /// - **Serialized / Split**: builds file paths from known context names
+    ///   without enumerating the directory (avoids `read_dir` permission issues
+    ///   on low-privilege Android users).
     pub fn prop_area_files(&self) -> io::Result<Vec<(String, PathBuf)>> {
         match &self.storage {
             ContextStorage::PreSplit => Ok(vec![(
@@ -648,19 +649,21 @@ impl PropertyContext {
                 self.props_dir.clone(),
             )]),
             _ => {
-                let mut files = Vec::new();
-                for entry in fs::read_dir(&self.props_dir)? {
-                    let entry = entry?;
-                    let fname = entry.file_name().to_string_lossy().into_owned();
-                    if fname == "property_info" || fname == "properties_serial" {
-                        continue;
-                    }
-                    if entry.path().is_file() {
-                        files.push((fname, entry.path()));
-                    }
-                }
-                files.sort_by(|a, b| a.0.cmp(&b.0));
-                Ok(files)
+                let mut names: Vec<String> = self
+                    .list_all_contexts()
+                    .into_iter()
+                    .map(|ctx| ctx.to_string())
+                    .collect();
+                names.sort();
+                names.dedup();
+
+                Ok(names
+                    .into_iter()
+                    .map(|ctx| {
+                        let path = self.context_file_path(&ctx);
+                        (ctx, path)
+                    })
+                    .collect())
             }
         }
     }

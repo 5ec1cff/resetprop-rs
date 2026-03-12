@@ -32,7 +32,7 @@
 //! | `--system-root` | optional | optional (default `/`) |
 
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -400,31 +400,13 @@ fn cmd_list_contexts(
 ) -> AppResult<()> {
     let pc = load_context(props_dir, system_root)?;
 
-    // Contexts known to the property_info / property_contexts parser.
-    let from_parser: Vec<String> = pc
+    // Only use contexts known to the parser; do not enumerate props dir,
+    // because low-privilege Android users may not be allowed to read it.
+    let all: BTreeSet<String> = pc
         .list_all_contexts()
         .into_iter()
         .map(|s| s.to_string())
         .collect();
-
-    // Contexts that actually have a file on disk (may include extras not in parser).
-    let props_root = pc.props_dir();
-    let from_files: BTreeSet<String> = if props_root.is_dir() {
-        match fs::read_dir(props_root) {
-            Ok(iter) => iter
-                .flatten()
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| n != "property_info" && n != "properties_serial")
-                .collect(),
-            Err(_) => BTreeSet::new(),
-        }
-    } else {
-        BTreeSet::new()
-    };
-
-    // Merge both sources.
-    let mut all: BTreeSet<String> = from_parser.into_iter().collect();
-    all.extend(from_files);
 
     let width = all.iter().map(|s| s.len()).max().unwrap_or(0);
     for name in &all {
