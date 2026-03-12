@@ -27,3 +27,4 @@ path = "src/bin/cargo_android_sysprop.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+memmap2 = "0.9"

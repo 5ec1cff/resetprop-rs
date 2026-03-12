@@ -34,10 +34,12 @@
 use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
 use std::io;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use memmap2::{Mmap, MmapMut, MmapOptions};
 
 use resetprop_rs::{PropArea, PropAreaError, PropertyContext};
 
@@ -211,11 +213,18 @@ enum AreaCommand {
 type AppError = Box<dyn std::error::Error>;
 type AppResult<T> = Result<T, AppError>;
 
+type MmapRoArea = PropArea<MmapCursor<Mmap>>;
+type MmapRwArea = PropArea<MmapCursor<MmapMut>>;
+
 // Converting PropAreaError to Box<dyn Error> is automatic via From<E: Error>.
 // We add a blanket helper for ergonomic use with ?
 
 fn prop_area_err(e: PropAreaError) -> AppError {
     Box::new(e)
+}
+
+fn path_io_err(path: &Path, err: io::Error) -> AppError {
+    AppError::from(format!("{}: {err}", path.display()))
 }
 
 #[derive(Debug)]
@@ -224,32 +233,124 @@ enum OpenAreaRoDetailedError {
     Parse(PropAreaError),
 }
 
+#[derive(Debug)]
+struct MmapCursor<M> {
+    map: M,
+    pos: usize,
+}
+
+impl<M> MmapCursor<M> {
+    fn new(map: M) -> Self {
+        Self { map, pos: 0 }
+    }
+}
+
+impl MmapCursor<MmapMut> {
+    fn flush(&self) -> io::Result<()> {
+        self.map.flush()
+    }
+}
+
+impl<M: AsRef<[u8]>> Read for MmapCursor<M> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let data = self.map.as_ref();
+        if self.pos >= data.len() {
+            return Ok(0);
+        }
+
+        let count = (data.len() - self.pos).min(buf.len());
+        buf[..count].copy_from_slice(&data[self.pos..self.pos + count]);
+        self.pos += count;
+        Ok(count)
+    }
+}
+
+impl<M: AsRef<[u8]>> Seek for MmapCursor<M> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let len = self.map.as_ref().len() as i64;
+        let current = self.pos as i64;
+        let next = match pos {
+            SeekFrom::Start(offset) => i64::try_from(offset)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "seek overflow"))?,
+            SeekFrom::End(offset) => len
+                .checked_add(offset)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek overflow"))?,
+            SeekFrom::Current(offset) => current
+                .checked_add(offset)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek overflow"))?,
+        };
+
+        if next < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot seek before start of mmap",
+            ));
+        }
+
+        self.pos = usize::try_from(next)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "seek overflow"))?;
+        Ok(self.pos as u64)
+    }
+}
+
+impl Write for MmapCursor<MmapMut> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let data = &mut self.map[..];
+        if self.pos > data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "write past end of mmap",
+            ));
+        }
+
+        let remaining = data.len() - self.pos;
+        if buf.len() > remaining {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "mmap write exceeds mapped region",
+            ));
+        }
+
+        data[self.pos..self.pos + buf.len()].copy_from_slice(buf);
+        self.pos += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.map.flush()
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Open a prop area file read-only.
-fn open_area_ro(path: &Path) -> AppResult<PropArea<File>> {
-    let f = File::open(path)
+/// Open a prop area file read-only using a read-only memory map.
+fn open_area_ro(path: &Path) -> AppResult<MmapRoArea> {
+    let f = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let map = unsafe { MmapOptions::new().map(&f) }
         .map_err(|e| format!("{}: {e}", path.display()))?;
-    PropArea::new(f).map_err(prop_area_err)
+    PropArea::new(MmapCursor::new(map)).map_err(prop_area_err)
 }
 
 /// Open a prop area file read-only while preserving whether the failure came
 /// from the file open itself or from parsing the prop area contents.
-fn open_area_ro_detailed(path: &Path) -> Result<PropArea<File>, OpenAreaRoDetailedError> {
+fn open_area_ro_detailed(path: &Path) -> Result<MmapRoArea, OpenAreaRoDetailedError> {
     let f = File::open(path).map_err(OpenAreaRoDetailedError::Io)?;
-    PropArea::new(f).map_err(OpenAreaRoDetailedError::Parse)
+    let map = unsafe { MmapOptions::new().map(&f) }.map_err(OpenAreaRoDetailedError::Io)?;
+    PropArea::new(MmapCursor::new(map)).map_err(OpenAreaRoDetailedError::Parse)
 }
 
-/// Open a prop area file read-write.
-fn open_area_rw(path: &Path) -> AppResult<PropArea<File>> {
+/// Open a prop area file read-write using a shared read-write memory map.
+fn open_area_rw(path: &Path) -> AppResult<MmapRwArea> {
     let f = OpenOptions::new()
         .read(true)
         .write(true)
         .open(path)
         .map_err(|e| format!("{}: {e}", path.display()))?;
-    PropArea::new(f).map_err(prop_area_err)
+    let map = unsafe { MmapOptions::new().map_mut(&f) }
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    PropArea::new(MmapCursor::new(map)).map_err(prop_area_err)
 }
 
 fn require_props_dir<'a>(props_dir: Option<&'a Path>) -> AppResult<&'a Path> {
@@ -331,7 +432,8 @@ fn cmd_set(
     let area_path = pc.context_file_path(ctx_name);
 
     let mut area = open_area_rw(&area_path)?;
-    area.set_property(key, value).map_err(prop_area_err)
+    area.set_property(key, value).map_err(prop_area_err)?;
+    area.into_inner().flush().map_err(|e| path_io_err(&area_path, e))
 }
 
 fn cmd_del(props_dir: Option<&Path>, system_root: Option<&Path>, key: &str) -> AppResult<()> {
@@ -345,6 +447,7 @@ fn cmd_del(props_dir: Option<&Path>, system_root: Option<&Path>, key: &str) -> A
         eprintln!("{key}: property not found");
         process::exit(1);
     }
+    area.into_inner().flush().map_err(|e| path_io_err(&area_path, e))?;
     Ok(())
 }
 
@@ -532,6 +635,7 @@ fn cmd_area(props_dir: Option<&Path>, system_root: Option<&Path>, args: &AreaArg
         AreaCommand::Set { key, value } => {
             let mut area = open_area_rw(&area_path)?;
             area.set_property(key, value).map_err(prop_area_err)?;
+            area.into_inner().flush().map_err(|e| path_io_err(&area_path, e))?;
         }
 
         AreaCommand::Del { key } => {
@@ -541,6 +645,7 @@ fn cmd_area(props_dir: Option<&Path>, system_root: Option<&Path>, args: &AreaArg
                 eprintln!("{key}: property not found");
                 process::exit(1);
             }
+            area.into_inner().flush().map_err(|e| path_io_err(&area_path, e))?;
         }
 
         AreaCommand::List => {
