@@ -11,6 +11,7 @@
 - 通过 Android `property_contexts` 将属性名解析到正确的 SELinux context
 - 检查分配布局、空洞和 dirty-backup 区域
 - 对删除后的空洞执行 compact 回收
+- 读写 Android persistent property 文件（`persistent_properties` protobuf 格式）
 - 同时作为可复用库和命令行工具使用
 
 虽然名字叫 `resetprop-rs`，但它**不是** Magisk `resetprop` 的包装器。它直接理解 Android 属性区和 context 元数据的底层结构。
@@ -114,6 +115,7 @@ property context 解析器使用普通文件 I/O，可以直接处理从 Android
 - `src/lib.rs` — 对外导出的库接口
 - `src/prop_area.rs` — prop-area 底层解析、修改、scan、compact
 - `src/property_context.rs` — Android property context 解析与 context 路由
+- `src/persistent_prop.rs` — persistent property protobuf 增删查改（纯 Rust stdlib，无 libc）
 - `src/bin/sysprop.rs` — 主 CLI
 - `src/bin/read_props.rs` — 简化版原始读取工具
 - `src/bin/write_props.rs` — 简化版原始写入工具
@@ -154,6 +156,21 @@ cargo run --bin sysprop -- --props-dir <PROPS_DIR> scan --objects
 cargo run --bin sysprop -- --props-dir <PROPS_DIR> compact
 ```
 
+#### `--persistent` 参数（仅 Android）
+
+`set` 和 `del` 支持 `--persistent` 参数，加上之后会**同时**写入 prop area 和
+`/data/property/persistent_properties`，使修改在重启后依然生效：
+
+```bash
+# 写入 prop area，同时持久化（重启保留）
+sysprop --props-dir <PROPS_DIR> set persist.sys.locale en-US --persistent
+# 从 prop area 删除，同时从 persistent storage 中删除
+sysprop --props-dir <PROPS_DIR> del persist.sys.locale --persistent
+```
+
+`get` 和 `list` 也支持 `--persistent`；加上后会直接读取
+`/data/property/persistent_properties`，而不是 prop area。
+
 如果只想处理某一个 context：
 
 ```bash
@@ -162,6 +179,32 @@ cargo run --bin sysprop -- --props-dir <PROPS_DIR> compact --context u:object_r:
 ```
 
 在非 Android 宿主机上，如果 context 存储模式是 `Split`，通常还需要加上 `--system-root <ANDROID_ROOT>`。
+
+### Persistent property 文件操作
+
+`persistent-file` 子命令直接操作 Android `persistent_properties` protobuf 文件，全平台可用；
+在非 Android 宿主机上需要用 `--path` 指定文件路径。
+
+```bash
+# 列出所有 persistent 属性
+cargo run --bin sysprop -- persistent-file --path /data/property/persistent_properties list
+
+# 获取单个属性
+cargo run --bin sysprop -- persistent-file --path /data/property/persistent_properties get persist.sys.locale
+
+# 设置属性（原子写入，重启保留）
+cargo run --bin sysprop -- persistent-file --path /data/property/persistent_properties set persist.sys.locale en-US
+
+# 删除属性
+cargo run --bin sysprop -- persistent-file --path /data/property/persistent_properties del persist.sys.locale
+```
+
+在 Android 上路径默认为 `/data/property/persistent_properties`，可以省略 `--path`：
+
+```bash
+sysprop persistent-file list
+sysprop persistent-file get persist.sys.locale
+```
 
 ### 直接针对单个 area 的操作
 

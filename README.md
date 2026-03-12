@@ -11,6 +11,7 @@ It can:
 - resolve property names to SELinux contexts through Android `property_contexts`
 - inspect allocation layout, holes, and dirty-backup regions
 - compact holes left behind by deletions
+- read and write Android persistent property files (`persistent_properties` protobuf format)
 - run as both a reusable library and a practical CLI
 
 Despite the name, this is **not** a wrapper around Magisk's `resetprop`. It directly understands Android's property-area data structures and context metadata.
@@ -106,6 +107,7 @@ The test suite covers:
 - `src/lib.rs` — public library exports
 - `src/prop_area.rs` — low-level prop-area parsing, editing, scanning, compaction
 - `src/property_context.rs` — Android property-context parsing and context resolution
+- `src/persistent_prop.rs` — persistent property protobuf CRUD (no libc, pure Rust stdlib)
 - `src/bin/sysprop.rs` — main CLI
 - `src/bin/read_props.rs` — simple raw reader
 - `src/bin/write_props.rs` — simple raw writer
@@ -146,6 +148,21 @@ cargo run --bin sysprop -- --props-dir <PROPS_DIR> scan --objects
 cargo run --bin sysprop -- --props-dir <PROPS_DIR> compact
 ```
 
+#### `--persistent` flag (Android only)
+
+`set` and `del` support a `--persistent` flag that writes to **both** the prop area and
+`/data/property/persistent_properties`, so the change survives a reboot:
+
+```bash
+# Write to prop area AND persist across reboots
+sysprop --props-dir <PROPS_DIR> set persist.sys.locale en-US --persistent
+# Delete from prop area AND remove from persistent storage
+sysprop --props-dir <PROPS_DIR> del persist.sys.locale --persistent
+```
+
+`get` and `list` also accept `--persistent`; in that mode they read directly from
+`/data/property/persistent_properties` instead of the prop area.
+
 If you only want one context:
 
 ```bash
@@ -154,6 +171,32 @@ cargo run --bin sysprop -- --props-dir <PROPS_DIR> compact --context u:object_r:
 ```
 
 On non-Android hosts, `--system-root <ANDROID_ROOT>` may also be needed when the context storage format is `Split`.
+
+### Persistent property file operations
+
+The `persistent-file` subcommand operates on an Android `persistent_properties` protobuf file
+directly. It works on any platform; on non-Android hosts `--path` is required.
+
+```bash
+# List all persistent properties
+cargo run --bin sysprop -- persistent-file --path /data/property/persistent_properties list
+
+# Get a single property
+cargo run --bin sysprop -- persistent-file --path /data/property/persistent_properties get persist.sys.locale
+
+# Set a property (atomic write, survives reboot)
+cargo run --bin sysprop -- persistent-file --path /data/property/persistent_properties set persist.sys.locale en-US
+
+# Delete a property
+cargo run --bin sysprop -- persistent-file --path /data/property/persistent_properties del persist.sys.locale
+```
+
+On Android the path defaults to `/data/property/persistent_properties` and may be omitted:
+
+```bash
+sysprop persistent-file list
+sysprop persistent-file get persist.sys.locale
+```
 
 ### Single-area operations
 
