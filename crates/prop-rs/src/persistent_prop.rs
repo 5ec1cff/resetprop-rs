@@ -190,11 +190,14 @@ fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> PersistentResult<()> {
         let tmp_name = format!(".{file_name}.{pid}.{ts}.{attempt}.tmp");
         let tmp_path = parent.join(tmp_name);
 
-        let mut file = match OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&tmp_path)
-        {
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        // init skips persistent property files accessible by group or others
+        // ("Skipping insecure file"), so never inherit the caller's umask.
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+
+        let mut file = match options.open(&tmp_path) {
             Ok(file) => file,
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(err.into()),

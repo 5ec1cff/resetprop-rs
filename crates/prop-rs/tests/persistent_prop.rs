@@ -66,6 +66,28 @@ fn persistent_props_write_and_load_from_file() {
     std::fs::remove_file(&path).expect("cleanup failed");
 }
 
+#[cfg(unix)]
+#[test]
+fn persistent_props_write_replaces_file_with_mode_0600() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = unique_temp_path("file-mode");
+    std::fs::write(&path, b"").expect("create failed");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod failed");
+
+    let mut props = PersistentPropertyFile::default();
+    props.set("persist.one", "v1");
+    props.write_to_path(&path).expect("write failed");
+
+    let mode = std::fs::metadata(&path)
+        .expect("stat failed")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+
+    std::fs::remove_file(&path).expect("cleanup failed");
+}
+
 #[test]
 fn persistent_props_load_or_default_on_missing_file() {
     let path = unique_temp_path("missing");
